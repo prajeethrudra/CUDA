@@ -1,0 +1,210 @@
+
+// Application, read and display bitmap file.
+
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+#include "cpu_bitmap.h"
+#include "bitmap_help.h"
+
+#define CHANNELS 4
+
+#define BLOCK_SIZE (32)
+
+
+__global__ void imageFlip(unsigned char *image,int sizeX, int sizeY)
+{
+	
+	
+	int i = blockIdx.y * BLOCK_SIZE + threadIdx.y; // satýr No.
+
+	int j = blockIdx.x * BLOCK_SIZE + threadIdx.x; // sütun No.
+
+	//int cIdx2 = ((sizeX-1-threadIdx.x)+threadIdx.y*sizeX)*4;
+	int cIdx2=((threadIdx.y)*sizeX+threadIdx.x)*4 ;// 3 ile çarpým RGB için, linearIndex.
+    int xc = sizeX - sizeX/2;
+    int yc = sizeY - sizeY/2;
+	int cosine=0;int sine=1;
+    int newx = ((float)i-xc)*cosine - ((float)j-yc)*sine + xc;
+    int newy = ((float)i-xc)*sine + ((float)j-yc)*cosine + yc;
+	
+	int cIdx = ( newy * sizeX + newx ) * 4;
+	/*
+	       *( image + linearIndex ): Blue, in [0, 1]
+		   *( image + linearIndex + 1 ): Green, in [0, 1]
+		   *( image + linearIndex + 2 ): Red, in [0, 1]
+	*/
+
+	__shared__ unsigned char smBlockB[BLOCK_SIZE][BLOCK_SIZE];
+	__shared__ unsigned char smBlockG[BLOCK_SIZE][BLOCK_SIZE];
+	__shared__ unsigned char smBlockR[BLOCK_SIZE][BLOCK_SIZE];
+
+	smBlockB[threadIdx.x][threadIdx.y] = image[ cIdx ];
+	smBlockG[threadIdx.x][threadIdx.y] = image[ cIdx + 1 ];
+	smBlockR[threadIdx.x][threadIdx.y] = image[ cIdx + 2 ];
+
+	__syncthreads();	
+	printf("cidx %d,cidx2 %d sizeX %d sizey %d \n",cIdx,cIdx2,sizeX,sizeY);
+	image[ cIdx2 ]     =	smBlockB[threadIdx.y][threadIdx.x];
+	image[ cIdx2 + 1 ] = smBlockG[threadIdx.y][threadIdx.x];
+	image[ cIdx2 + 2 ] = smBlockR[threadIdx.y][threadIdx.x];
+}
+
+
+__host__ void imgProc(unsigned char *map, int size, int width, int height) {
+	
+	unsigned char* grayImage;
+    size_t imgSize = size;
+printf("color value of red is %zu,width %d and,height %d ", imgSize,width,height);
+   cudaMalloc((void**)&grayImage,imgSize);
+   cudaMemcpy(grayImage,map,imgSize,cudaMemcpyHostToDevice);
+dim3 dimBlock( BLOCK_SIZE, BLOCK_SIZE );
+dim3 dimGrid( width / dimBlock.x, height / dimBlock.y );
+   
+   imageFlip<<< dimGrid, dimBlock >>>(grayImage, width, height);
+   cudaDeviceSynchronize();
+   cudaMemcpy(map,grayImage,imgSize,cudaMemcpyDeviceToHost);
+   return;
+}
+
+int main(void) {
+   char fname[50];
+   FILE* infile;
+   unsigned short ftype;
+   tagBMFH bitHead;
+   tagBMIH bitInfoHead;
+   tagRGBQ *pRgb;
+
+   printf("Please enter the .bmp file name: ");
+   scanf("%s", fname);
+   strcat(fname,".bmp");
+   infile = fopen(fname, "rb");
+
+   if (infile != NULL) {
+      printf("File open successful.\n");
+      fread(&ftype, 1, sizeof(unsigned short), infile);
+      if (ftype != 0x4d42)
+      {
+         printf("File not .bmp format.\n");
+         return 1;
+      }
+      fread(&bitHead, 1, sizeof(tagBMFH), infile);
+      fread(&bitInfoHead, 1, sizeof(tagBMIH), infile);      
+   }
+   else {
+      printf("File open fail.\n");
+      return 1;
+   }
+
+   if (bitInfoHead.biBitCount < 24) {
+      long nPlateNum = long(pow(2, double(bitInfoHead.biBitCount)));
+      pRgb = (tagRGBQ *)malloc(nPlateNum * sizeof(tagRGBQ));
+      memset(pRgb, 0, nPlateNum * sizeof(tagRGBQ));
+      int num = fread(pRgb, 4, nPlateNum, infile);
+   }
+
+   int width = bitInfoHead.biWidth;
+   int height = bitInfoHead.biHeight;
+   int l_width = 4 * ((width * bitInfoHead.biBitCount + 31) / 32);
+   long nData = height * l_width;
+   unsigned char *pColorData = (unsigned char *)malloc(nData);
+   memset(pColorData, 0, nData);
+   fread(pColorData, 1, nData, infile);
+
+   fclose(infile);
+   
+   CPUBitmap dataOfBmp(width, height);
+   unsigned char *map = dataOfBmp.get_ptr();
+
+   if (bitInfoHead.biBitCount < 24) {
+      int k, index = 0;
+      if (bitInfoHead.biBitCount == 1) {
+         for (int i = 0; i < height; i++)
+            for (int j = 0; j < width; j++) {
+               unsigned char mixIndex = 0;
+               k = i * l_width + j / 8;
+               mixIndex = pColorData[k];
+               if (j % 8 < 7) mixIndex = mixIndex << (7 - (j % 8));
+               mixIndex = mixIndex >> 7;
+               map[index * 4 + 0] = pRgb[mixIndex].rgbRed;
+               map[index * 4 + 1] = pRgb[mixIndex].rgbGreen;
+               map[index * 4 + 2] = pRgb[mixIndex].rgbBlue;
+               map[index * 4 + 3] = pRgb[mixIndex].rgbReserved;
+               index++;
+            }
+       }
+       else if (bitInfoHead.biBitCount == 2) {
+         for (int i = 0; i < height; i++)
+            for (int j = 0; j < width; j++) {
+               unsigned char mixIndex = 0;
+               k = i * l_width + j / 4;
+               mixIndex = pColorData[k];
+               if (j % 4 < 3) mixIndex = mixIndex << (6 - 2 * (j % 4));
+               mixIndex = mixIndex >> 6;
+               map[index * 4 + 0] = pRgb[mixIndex].rgbRed;
+               map[index * 4 + 1] = pRgb[mixIndex].rgbGreen;
+               map[index * 4 + 2] = pRgb[mixIndex].rgbBlue;
+               map[index * 4 + 3] = pRgb[mixIndex].rgbReserved;
+               index++;
+            }
+       }
+       else if (bitInfoHead.biBitCount == 4) {
+         for (int i = 0; i < height; i++)
+            for (int j = 0; j < width; j++) {
+               unsigned char mixIndex = 0;
+               k = i * l_width + j / 2;
+               mixIndex = pColorData[k];
+               if (j % 2 == 0) mixIndex = mixIndex << 4;
+               mixIndex = mixIndex >> 4;
+               map[index * 4 + 0] = pRgb[mixIndex].rgbRed;
+               map[index * 4 + 1] = pRgb[mixIndex].rgbGreen;
+               map[index * 4 + 2] = pRgb[mixIndex].rgbBlue;
+               map[index * 4 + 3] = pRgb[mixIndex].rgbReserved;
+               index++;
+            }
+       }
+       else if (bitInfoHead.biBitCount == 8) {
+         for (int i = 0; i < height; i++)
+            for (int j = 0; j < width; j++) {
+               unsigned char mixIndex = 0;
+               k = i * l_width + j;
+               mixIndex = pColorData[k];
+               map[index * 4 + 0] = pRgb[mixIndex].rgbRed;
+               map[index * 4 + 1] = pRgb[mixIndex].rgbGreen;
+               map[index * 4 + 2] = pRgb[mixIndex].rgbBlue;
+               map[index * 4 + 3] = pRgb[mixIndex].rgbReserved;
+               index++;
+            }
+       }
+       else if (bitInfoHead.biBitCount == 16) {
+         for (int i = 0; i < height; i++)
+            for (int j = 0; j < width; j++) {
+               unsigned char mixIndex = 0;
+               k = i * l_width + j * 2;
+               unsigned char shortTemp = pColorData[k + 1] << 8;
+               mixIndex = pColorData[k] + shortTemp;
+               map[index * 4 + 0] = pRgb[mixIndex].rgbRed;
+               map[index * 4 + 1] = pRgb[mixIndex].rgbGreen;
+               map[index * 4 + 2] = pRgb[mixIndex].rgbBlue;
+               map[index * 4 + 3] = pRgb[mixIndex].rgbReserved;
+               index++;
+            }
+       }
+   }
+   else {
+      int k, index = 0;
+      for (int i = 0; i < height; i++)
+         for (int j = 0; j < width; j++) {
+            k = i * l_width + j * 3;
+            map[index * 4 + 0] = pColorData[k + 2];
+            map[index * 4 + 1] = pColorData[k + 1];
+            map[index * 4 + 2] = pColorData[k];
+            index++;
+         }
+   }
+
+   imgProc(map, dataOfBmp.image_size(), width, height);
+   dataOfBmp.display_and_exit();
+   return 0;
+}
